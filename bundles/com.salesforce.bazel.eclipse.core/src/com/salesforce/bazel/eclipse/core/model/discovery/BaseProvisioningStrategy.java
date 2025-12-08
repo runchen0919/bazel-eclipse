@@ -222,6 +222,304 @@ public abstract class BaseProvisioningStrategy implements TargetProvisioningStra
     private String jreSystemLibraryConfiguration;
 
     /**
+     * Set to track temporary placeholder Java files created during provisioning
+     */
+    private final Set<java.nio.file.Path> temporaryPlaceholderFiles = new HashSet<>();
+
+    /**
+     * Ensures that at least one Java file exists in the package directory when srcs contains content. If no Java files
+     * exist in the BUILD file's directory, creates a temporary placeholder Java file.
+     *
+     * @param bazelTarget
+     *            the Bazel target to check
+     * @param srcs
+     *            the list of source files from the target's srcs attribute
+     * @return the temporary file name if created, or null if no temporary file was needed
+     * @throws CoreException
+     */
+    private String ensureJavaFileExistsInPackage(BazelTarget bazelTarget, List<String> srcs) throws CoreException {
+        if ((srcs == null) || srcs.isEmpty()) {
+            return null;
+        }
+
+        try {
+            // Get the package directory (where the BUILD file is located)
+            var packageLocation = bazelTarget.getBazelPackage().getLocation();
+            var packagePath = packageLocation.toPath();
+
+            // Check if there are any .java files in the package directory
+            var hasJavaFiles = Files.walk(packagePath, 1)
+                    .filter(Files::isRegularFile)
+                    .anyMatch(path -> path.toString().endsWith(".java"));
+
+            if (!hasJavaFiles) {
+                // Create a temporary placeholder Java file
+                var tempJavaFileName = ".bazel_eclipse_placeholder.java";
+                var tempJavaFile = packagePath.resolve(tempJavaFileName);
+
+                if (!Files.exists(tempJavaFile)) {
+                    // Infer package name from existing Java files in srcs
+                    String packageName = inferPackageNameFromSrcs(bazelTarget, srcs, packagePath);
+                    if (packageName == null) {
+                        packageName = "";
+                    }
+                    var javaContent = format(
+                        "// Auto-generated placeholder by Bazel Eclipse Plugin%n"
+                                + "// This file ensures proper project setup when no Java sources exist in the package%n"
+                                + "%s%n" + "class BazelEclipsePlaceholder {%n"
+                                + "    // Placeholder class - can be safely deleted if real Java sources are added%n"
+                                + "}%n",
+                        packageName.isEmpty() ? "" : "package " + packageName + ";");
+
+                    Files.writeString(tempJavaFile, javaContent, StandardCharsets.UTF_8);
+                    temporaryPlaceholderFiles.add(tempJavaFile);
+                    LOG.debug(
+                        "Created temporary Java file '{}' for target '{}' as no Java files exist in package directory",
+                        tempJavaFileName,
+                        bazelTarget.getLabel());
+
+                    // Return the full Bazel label path format: //package/path:target_name/file.java
+                    return format(
+                        "//%s:%s",
+                        bazelTarget.getBazelPackage().getWorkspaceRelativePath().toString(),
+                        tempJavaFileName);
+                }
+                // File already exists, add to tracking set
+                temporaryPlaceholderFiles.add(tempJavaFile);
+                return format(
+                    "//%s:%s",
+                    bazelTarget.getBazelPackage().getWorkspaceRelativePath().toString(),
+                    tempJavaFileName);
+            }
+        } catch (IOException e) {
+            LOG.warn(
+                "Failed to check for Java files or create temporary file in package '{}': {}",
+                bazelTarget.getBazelPackage().getLabel(),
+                e.getMessage(),
+                e);
+        }
+        return null;
+    }
+
+    /**
+     * Infers the correct package name by analyzing existing Java files in srcs.
+     * <p>
+     * This method reads Java source files to find package declarations and calculates the correct package name by
+     * removing the source root prefix from the workspace relative path.
+     * </p>
+     *
+     * @param bazelTarget
+     *            the Bazel target
+     * @param srcs
+     *            list of source files from the target
+     * @param packagePath
+     *            the physical package directory path
+     * @return the inferred package name, or empty string if cannot be determined
+     */
+    private String inferPackageNameFromSrcs(BazelTarget bazelTarget, List<String> srcs,
+            java.nio.file.Path packagePath) {
+        try {
+            // Try to find a Java file in srcs and read its package declaration
+            for (String src : srcs) {
+                if (!src.endsWith(".java")) {
+                    continue;
+                }
+
+                // Extract the file path from the Bazel label (format: //package:target/file.java)
+                var srcParts = src.split(":");
+                if (srcParts.length != 2) {
+                    continue; // Skip malformed labels
+                }
+
+                // Construct the full path: bazelPackage.getLocation() + relativePath from label
+                var relativePath = srcParts[1];
+                var javaFile = bazelTarget.getBazelPackage().getLocation().toPath().resolve(relativePath);
+
+                if (!Files.exists(javaFile) || !Files.isRegularFile(javaFile)) {
+                    continue;
+                }
+
+                // Read and parse package declaration from the file
+                var packageDeclaration = extractPackageDeclaration(javaFile);
+                if (packageDeclaration != null && !packageDeclaration.isEmpty()) {
+                    // Calculate the actual package name for the BUILD directory
+                    // Example: packageDeclaration = "com.project.service.examples.demo"
+                    //          workspaceRelativePath = "src/java/com/project/service/examples"
+                    // We need to find where the package path starts in the workspace path
+                    var workspaceRelativePath = bazelTarget.getBazelPackage().getWorkspaceRelativePath().toString();
+                    var workspacePackageParts = workspaceRelativePath.replace('/', '.');
+
+                    // Find the common suffix between packageDeclaration and workspacePackageParts
+                    // to determine the source root and calculate the actual package name
+                    String actualPackageName = calculateActualPackageName(packageDeclaration, workspacePackageParts);
+
+                    LOG.debug(
+                        "Inferred package name '{}' from source file '{}' (original: '{}') for target '{}'",
+                        actualPackageName,
+                        relativePath,
+                        packageDeclaration,
+                        bazelTarget.getLabel());
+                    return actualPackageName;
+                }
+            }
+
+            // Fallback: use workspace relative path if no package declaration found
+            var workspaceRelativePath = bazelTarget.getBazelPackage().getWorkspaceRelativePath().toString();
+            LOG.debug(
+                "Could not infer package from srcs, using workspace relative path '{}' for target '{}'",
+                workspaceRelativePath,
+                bazelTarget.getLabel());
+            return workspaceRelativePath.replace('/', '.');
+        } catch (Exception e) {
+            LOG.warn(
+                "Failed to infer package name from srcs for target '{}': {}",
+                bazelTarget.getLabel(),
+                e.getMessage());
+            // Fallback to workspace relative path
+            return bazelTarget.getBazelPackage().getWorkspaceRelativePath().toString().replace('/', '.');
+        }
+    }
+
+    /**
+     * Calculates the actual package name for the BUILD directory based on the package declaration from a Java file.
+     * <p>
+     * Example: If packageDeclaration = "com.project.service.examples.demo" and
+     * workspacePackageParts = "src.java.com.project.service.examples", this method finds the
+     * longest continuous common substring "com.project.service.examples" and returns it.
+     * </p>
+     *
+     * @param packageDeclaration
+     *            the package name from Java file (e.g., "com.example.foo.bar")
+     * @param workspacePackageParts
+     *            the workspace relative path converted to dot notation (e.g., "src.main.java.com.example.foo")
+     * @return the actual package name for the BUILD directory
+     */
+    private String calculateActualPackageName(String packageDeclaration, String workspacePackageParts) {
+        // Split both into parts
+        String[] packageParts = packageDeclaration.split("\\.");
+        String[] workspaceParts = workspacePackageParts.split("\\.");
+
+        // Find the longest continuous common substring using dynamic programming
+        int maxLength = 0;
+        int endIndexInWorkspace = 0;
+
+        // Dynamic programming table to store lengths of common substrings
+        for (int i = 0; i < packageParts.length; i++) {
+            for (int j = 0; j < workspaceParts.length; j++) {
+                if (packageParts[i].equals(workspaceParts[j])) {
+                    // Count consecutive matches
+                    int length = 1;
+                    int pi = i + 1;
+                    int pj = j + 1;
+
+                    while (pi < packageParts.length && pj < workspaceParts.length
+                            && packageParts[pi].equals(workspaceParts[pj])) {
+                        length++;
+                        pi++;
+                        pj++;
+                    }
+
+                    // Update if we found a longer match
+                    if (length > maxLength) {
+                        maxLength = length;
+                        endIndexInWorkspace = j + length;
+                    }
+                }
+            }
+        }
+
+        // If we found a common substring, build the result from workspace parts
+        if (maxLength > 0) {
+            StringBuilder result = new StringBuilder();
+            for (int i = endIndexInWorkspace - maxLength; i < endIndexInWorkspace; i++) {
+                if (result.length() > 0) {
+                    result.append('.');
+                }
+                result.append(workspaceParts[i]);
+            }
+            return result.toString();
+        }
+
+        // No match found, return the workspace package parts as-is
+        return workspacePackageParts;
+    }
+
+    /**
+     * Extracts the package declaration from a Java source file.
+     *
+     * @param javaFile
+     *            the Java file to read
+     * @return the package name, or null if not found
+     * @throws IOException
+     */
+    private String extractPackageDeclaration(java.nio.file.Path javaFile) throws IOException {
+        try (var reader = Files.newBufferedReader(javaFile)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+
+                // Skip empty lines and comments
+                if (line.isEmpty() || line.startsWith("//")) {
+                    continue;
+                }
+
+                // Look for package declaration
+                if (line.startsWith("package ")) {
+                    var packageLine = line.substring(8).trim(); // Remove "package "
+                    var endIndex = packageLine.indexOf(';');
+                    if (endIndex > 0) {
+                        return packageLine.substring(0, endIndex).trim();
+                    }
+                }
+
+                // Stop if we hit a class/interface/enum declaration (package must come before)
+                if (line.startsWith("public ") || line.startsWith("class ") || line.startsWith("interface ")
+                        || line.startsWith("enum ") || line.startsWith("@interface ")) {
+                    break;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Deletes all temporary placeholder Java files that were created during provisioning.
+     * <p>
+     * This method should be called after project provisioning is complete to clean up temporary files.
+     * </p>
+     */
+    protected void cleanupTemporaryPlaceholderFiles() {
+        if (temporaryPlaceholderFiles.isEmpty()) {
+            return;
+        }
+
+        var deletedCount = 0;
+        var failedCount = 0;
+
+        for (java.nio.file.Path tempFile : temporaryPlaceholderFiles) {
+            try {
+                if (Files.exists(tempFile)) {
+                    Files.delete(tempFile);
+                    deletedCount++;
+                    LOG.debug("Deleted temporary placeholder file: {}", tempFile);
+                }
+            } catch (IOException e) {
+                failedCount++;
+                LOG.warn("Failed to delete temporary placeholder file '{}': {}", tempFile, e.getMessage(), e);
+            }
+        }
+
+        temporaryPlaceholderFiles.clear();
+
+        if (deletedCount > 0) {
+            LOG.info("Cleaned up {} temporary placeholder file(s)", deletedCount);
+        }
+        if (failedCount > 0) {
+            LOG.warn("Failed to delete {} temporary placeholder file(s)", failedCount);
+        }
+    }
+
+    /**
      * Adds all relevant information from a {@link BazelTarget} to the {@link JavaProjectInfo}.
      * <p>
      * This method obtains information from common <code>java_*</code> rule attributes.
@@ -252,11 +550,35 @@ public abstract class BaseProvisioningStrategy implements TargetProvisioningStra
 
         var srcs = attributes.getStringList(SRCS);
         if (srcs != null) {
+            // Check if there are any Java files in the BUILD file's directory
+            var tempJavaFile = ensureJavaFileExistsInPackage(bazelTarget, srcs);
+
+            if (tempJavaFile != null) {
+                LOG.debug(
+                    "Using temporary Java file '{}' for target '{}' to ensure proper project setup",
+                    tempJavaFile,
+                    bazelTarget.getLabel());
+                if (isTestTarget) {
+                    javaInfo.addTestSrc(tempJavaFile, settings);
+                } else {
+                    javaInfo.addSrc(tempJavaFile, settings);
+                }
+            }
+
             for (String src : srcs) {
                 if (isTestTarget) {
                     javaInfo.addTestSrc(src, settings);
                 } else {
                     javaInfo.addSrc(src, settings);
+                }
+            }
+
+            // Add temporary file if it was created
+            if (tempJavaFile != null) {
+                if (isTestTarget) {
+                    javaInfo.addTestSrc(tempJavaFile, settings);
+                } else {
+                    javaInfo.addSrc(tempJavaFile, settings);
                 }
             }
         }
@@ -1807,7 +2129,12 @@ public abstract class BaseProvisioningStrategy implements TargetProvisioningStra
             // configure the classpath of the workspace project
             configureRawClasspathOfWorkspaceProject(workspace.getBazelProject().getProject(), monitor.slice(1));
 
-            return doProvisionProjects(targetsOrPackages, workspace, monitor);
+            var projects = doProvisionProjects(targetsOrPackages, workspace, monitor);
+
+            // cleanup temporary placeholder files after provisioning is complete
+            cleanupTemporaryPlaceholderFiles();
+
+            return projects;
         } finally {
             progress.done();
         }
