@@ -20,6 +20,7 @@ import static java.util.stream.Collectors.toList;
 import static org.eclipse.core.runtime.IPath.fromPath;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -169,17 +170,33 @@ public class JavaAspectsInfo extends JavaClasspathJarLocationResolver {
                                 classJar);
                         }
                         targetLabel = Label.create(format("@_unknown_jar_//:%s", classJar.getRelativePath()));
-                    } else if (!targetLabel.isExternal()
-                            && !bazelWorkspace.getBazelPackage(new BazelLabel(targetLabel)).exists()) {
-                        // possibly an external jar produced within an external repo
-                        // see https://github.com/eclipseguru/bazel-eclipse/issues/34
-                        if (LOG.isDebugEnabled()) {
-                            LOG.debug(
-                                "The target '{}' of the runtime JAR file '{}' does not exist in the workspace.",
-                                targetLabel,
-                                classJar);
+                    } else if (!targetLabel.isExternal()) {
+                        // Check if this is actually an external JAR by examining its physical location
+                        // External dependencies are typically in external/ directory even if their
+                        // Target-Label looks like a local package (e.g., //3rdparty/java)
+                        var isExternalJar = isJarFromExternalRepository(localJar.getPath());
+                        var shouldTreatAsUnknown = isExternalJar;
+
+                        if (!isExternalJar) {
+                            // Not in external directory, verify the package exists
+                            var bazelPackage = bazelWorkspace.getBazelPackage(new BazelLabel(targetLabel));
+                            if (!bazelPackage.exists()) {
+                                shouldTreatAsUnknown = true;
+                            }
                         }
-                        targetLabel = Label.create(format("@_unknown_jar_//:%s", classJar.getRelativePath()));
+
+                        if (shouldTreatAsUnknown) {
+                            // possibly an external jar produced within an external repo
+                            // see https://github.com/eclipseguru/bazel-eclipse/issues/34
+                            if (LOG.isDebugEnabled()) {
+                                LOG.debug(
+                                    "The JAR '{}' with target '{}' is {} in the workspace.",
+                                    classJar,
+                                    targetLabel,
+                                    isExternalJar ? "from external repository" : "not found");
+                            }
+                            targetLabel = Label.create(format("@_unknown_jar_//:%s", classJar.getRelativePath()));
+                        }
                     }
 
                     var builder = LibraryArtifact.builder();
@@ -231,6 +248,36 @@ public class JavaAspectsInfo extends JavaClasspathJarLocationResolver {
 
     public BlazeJarLibrary getLibraryByJdepsRootRelativePath(String relativePath) {
         return libraryByJdepsRootRelativePath.get(relativePath);
+    }
+
+    /**
+     * Checks if a JAR file comes from an external Bazel repository.
+     * <p>
+     * External dependencies (e.g., from Maven) are placed in the {@code external/} directory, even if their
+     * Target-Label in the manifest looks like a local package (e.g., {@code //3rdparty/java}). This method examines the
+     * physical file path to determine if the JAR originates from an external repository.
+     * </p>
+     *
+     * @param jarPath
+     *            the absolute path to the JAR file
+     * @return {@code true} if the JAR is from an external repository, {@code false} otherwise
+     */
+    private boolean isJarFromExternalRepository(Path jarPath) {
+        try {
+            var executionRoot = getBlazeInfo().getExecutionRoot();
+            var relativeToExecRoot = executionRoot.relativize(jarPath);
+            var pathString = relativeToExecRoot.toString();
+
+            // External JARs are in paths like:
+            // - bazel-out/<config>/bin/external/<repo_name>/...
+            return pathString.startsWith("bazel-out/") && pathString.contains("/external/");
+        } catch (IllegalArgumentException e) {
+            // Path is not relative to execution root, assume it's external
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("JAR path '{}' is not under execution root, treating as external", jarPath);
+            }
+            return true;
+        }
     }
 
     public List<BlazeJarLibrary> getRuntimeClasspath(TargetKey targetKey) {
