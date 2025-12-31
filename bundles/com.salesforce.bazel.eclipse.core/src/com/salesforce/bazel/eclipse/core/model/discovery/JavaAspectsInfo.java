@@ -20,6 +20,8 @@ import static java.util.stream.Collectors.toList;
 import static org.eclipse.core.runtime.IPath.fromPath;
 
 import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.net.URLDecoder;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -73,6 +75,30 @@ public class JavaAspectsInfo extends JavaClasspathJarLocationResolver {
         return (target.getJavaIdeInfo() != null)
                 && (JavaBlazeRules.getJavaProtoLibraryKinds().contains(target.getKind())
                         || target.getKind().equals(GenericBlazeRules.RuleTypes.PROTO_LIBRARY.getKind()));
+    }
+
+    /**
+     * Sanitizes a file path for use in a Bazel label by URL-decoding any percent-encoded characters. This is needed
+     * because external repository paths may contain URL-encoded characters (e.g., %40 for @) which are not valid in
+     * Bazel target names.
+     * 
+     * @param path
+     *            the potentially URL-encoded path
+     * @return the decoded path safe for use in a Bazel label
+     */
+    private static String sanitizePathForLabel(String path) {
+        try {
+            // Decode URL-encoded characters (e.g., %40 -> @, %2F -> /)
+            return URLDecoder.decode(path, "UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            // UTF-8 is always supported, but handle the exception just in case
+            LOG.warn("Failed to URL-decode path '{}', using original path", path, e);
+            return path;
+        } catch (IllegalArgumentException e) {
+            // Handle invalid escape sequences
+            LOG.warn("Path '{}' contains invalid URL encoding, using original path", path, e);
+            return path;
+        }
     }
 
     final ParsedBepOutput aspectsBuildResult;
@@ -169,7 +195,8 @@ public class JavaAspectsInfo extends JavaClasspathJarLocationResolver {
                                 "Unable to compute target label for runtime jar '{}'. Please check if the rule producing the jar is adding the Target-Label to the jar manifest!",
                                 classJar);
                         }
-                        targetLabel = Label.create(format("@_unknown_jar_//:%s", classJar.getRelativePath()));
+                        targetLabel = Label.create(
+                            format("@_unknown_jar_//:%s", sanitizePathForLabel(classJar.getRelativePath())));
                     } else if (!targetLabel.isExternal()) {
                         // Check if this is actually an external JAR by examining its physical location
                         // External dependencies are typically in external/ directory even if their
@@ -195,7 +222,8 @@ public class JavaAspectsInfo extends JavaClasspathJarLocationResolver {
                                     targetLabel,
                                     isExternalJar ? "from external repository" : "not found");
                             }
-                            targetLabel = Label.create(format("@_unknown_jar_//:%s", classJar.getRelativePath()));
+                            targetLabel = Label.create(
+                                format("@_unknown_jar_//:%s", sanitizePathForLabel(classJar.getRelativePath())));
                         }
                     }
 
