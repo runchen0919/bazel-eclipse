@@ -63,13 +63,24 @@ public class BazelClasspathContainerRuntimeResolver
         }
 
         /**
+         * Begins the resolution of a project if the project was never processed before.
+         * <p>
+         * When this method returns <code>true</code>, a matching call to {@link #endResolvingProject(IProject)} must be
+         * made.
+         * </p>
+         *
          * @param project
          *            the project being resolved
-         * @return <code>true</code> if the project was never processed before, <code>false</code> otherwise
+         * @return <code>true</code> if the project was never processed before and resolution is tracked,
+         *         <code>false</code> otherwise
          */
-        public boolean beginResolvingProject(IProject project) {
-            currentDepth++;
-            return processedProjects.add(project);
+        public boolean beginResolvingProjectIfNeverProcessedBefore(IProject project) {
+            if (processedProjects.add(project)) {
+                currentDepth++;
+                return true;
+            }
+
+            return false;
         }
 
         public void endResolvingProject(IProject project) {
@@ -232,7 +243,7 @@ public class BazelClasspathContainerRuntimeResolver
                 case IClasspathEntry.CPE_PROJECT: {
                     // projects need to be resolved properly so we have all the output folders and exported jars on the classpath
                     var sourceProject = workspaceRoot.getProject(e.getPath().segment(0));
-                    if (resolutionContext.beginResolvingProject(sourceProject)) {
+                    if (resolutionContext.beginResolvingProjectIfNeverProcessedBefore(sourceProject)) {
                         try {
                             // only resolve and add the projects if it was never attempted before
                             populateWithResolvedProject(sourceProject, resolutionContext);
@@ -289,7 +300,7 @@ public class BazelClasspathContainerRuntimeResolver
         // this method can be entered recursively; luckily only within the same thread
         // therefore we use a ThreadLocal LinkedHashSet to keep track of recursive attempts
         var resolutionContext = currentThreadResolutionContet.get();
-        if (!resolutionContext.beginResolvingProject(project.getProject())) {
+        if (!resolutionContext.beginResolvingProjectIfNeverProcessedBefore(project.getProject())) {
             LOG.warn(
                 "Detected recursive resolution attempt for project '{}' in thread '{}' ({})",
                 project.getProject().getName(),
