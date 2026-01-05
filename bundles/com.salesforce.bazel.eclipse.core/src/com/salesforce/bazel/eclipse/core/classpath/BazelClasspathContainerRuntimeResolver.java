@@ -263,6 +263,11 @@ public class BazelClasspathContainerRuntimeResolver
                             // remove from stack again when done resolving
                             resolutionContext.endResolvingProject(sourceProject);
                         }
+                    } else if (LOG.isDebugEnabled()) {
+                        LOG.debug(
+                            "Skipping already processed project '{}' in thread '{}' to avoid cycle",
+                            sourceProject.getName(),
+                            Thread.currentThread().getName());
                     }
                     break;
                 }
@@ -372,7 +377,7 @@ public class BazelClasspathContainerRuntimeResolver
         // therefore we use a ThreadLocal LinkedHashSet to keep track of recursive attempts
         var resolutionContext = currentThreadResolutionContet.get();
 
-        // CRITICAL: Check if this is top-level BEFORE incrementing depth
+        // CRITICAL: Check if this is top-level BEFORE calling beginResolvingProject
         // This ensures ThreadLocal cleanup happens correctly
         var isTopLevelResolution = resolutionContext.currentDepth == 0;
 
@@ -381,16 +386,6 @@ public class BazelClasspathContainerRuntimeResolver
         if (!resolutionContext.beginResolvingProjectIfNeverProcessedBefore(project.getProject())) {
             LOG.warn(
                 "Detected recursive resolution attempt for project '{}' in thread '{}' - skipping to avoid cycle",
-                project.getProject().getName(),
-                Thread.currentThread().getName());
-            return new IRuntimeClasspathEntry[0];
-        }
-
-        // Now safe to increment depth counter
-        if (!resolutionContext.beginResolvingProject(project.getProject())) {
-            // This should never happen now due to the check above, but keep as safety net
-            LOG.error(
-                "Unexpected state: beginResolvingProject returned false after cycle check for project '{}' in thread '{}'",
                 project.getProject().getName(),
                 Thread.currentThread().getName());
             return new IRuntimeClasspathEntry[0];
