@@ -63,13 +63,24 @@ public class BazelClasspathContainerRuntimeResolver
         }
 
         /**
+         * Begins the resolution of a project if the project was never processed before.
+         * <p>
+         * When this method returns <code>true</code>, a matching call to {@link #endResolvingProject(IProject)} must be
+         * made.
+         * </p>
+         *
          * @param project
          *            the project being resolved
-         * @return <code>true</code> if the project was never processed before, <code>false</code> otherwise
+         * @return <code>true</code> if the project was never processed before and resolution is tracked,
+         *         <code>false</code> otherwise
          */
-        public boolean beginResolvingProject(IProject project) {
-            currentDepth++;
-            return processedProjects.add(project);
+        public boolean beginResolvingProjectIfNeverProcessedBefore(IProject project) {
+            if (processedProjects.add(project)) {
+                currentDepth++;
+                return true;
+            }
+
+            return false;
         }
 
         public void endResolvingProject(IProject project) {
@@ -244,7 +255,7 @@ public class BazelClasspathContainerRuntimeResolver
                         break;
                     }
 
-                    if (resolutionContext.beginResolvingProject(sourceProject)) {
+                    if (resolutionContext.beginResolvingProjectIfNeverProcessedBefore(sourceProject)) {
                         try {
                             // only resolve and add the projects if it was never attempted before
                             populateWithResolvedProject(sourceProject, resolutionContext);
@@ -252,6 +263,11 @@ public class BazelClasspathContainerRuntimeResolver
                             // remove from stack again when done resolving
                             resolutionContext.endResolvingProject(sourceProject);
                         }
+                    } else if (LOG.isDebugEnabled()) {
+                        LOG.debug(
+                            "Skipping already processed project '{}' in thread '{}' to avoid cycle",
+                            sourceProject.getName(),
+                            Thread.currentThread().getName());
                     }
                     break;
                 }
@@ -367,19 +383,9 @@ public class BazelClasspathContainerRuntimeResolver
 
         // Check for recursive resolution BEFORE calling beginResolvingProject
         // to avoid depth counter mismatch
-        if (resolutionContext.processedProjects.contains(project.getProject())) {
+        if (!resolutionContext.beginResolvingProjectIfNeverProcessedBefore(project.getProject())) {
             LOG.warn(
                 "Detected recursive resolution attempt for project '{}' in thread '{}' - skipping to avoid cycle",
-                project.getProject().getName(),
-                Thread.currentThread().getName());
-            return new IRuntimeClasspathEntry[0];
-        }
-
-        // Now safe to increment depth counter
-        if (!resolutionContext.beginResolvingProject(project.getProject())) {
-            // This should never happen now due to the check above, but keep as safety net
-            LOG.error(
-                "Unexpected state: beginResolvingProject returned false after cycle check for project '{}' in thread '{}'",
                 project.getProject().getName(),
                 Thread.currentThread().getName());
             return new IRuntimeClasspathEntry[0];
