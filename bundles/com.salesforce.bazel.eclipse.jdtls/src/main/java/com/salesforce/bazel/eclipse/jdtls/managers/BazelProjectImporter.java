@@ -20,6 +20,8 @@ import static java.lang.String.format;
 import static java.nio.file.Files.isRegularFile;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.HashSet;
@@ -82,6 +84,12 @@ public final class BazelProjectImporter extends AbstractProjectImporter {
 
     @Override
     public boolean applies(IProgressMonitor monitor) throws OperationCanceledException, CoreException {
+        // Check if Bazel Java integration is enabled via configuration file
+        if (!isBazelJavaEnabled()) {
+            JavaLanguageServerPlugin.logInfo("Bazel Java integration is disabled via configuration");
+            return false;
+        }
+
         if (directories == null) {
             var bazelDetector =
                     new BazelFileDetector(rootFolder.toPath(), WORKSPACE_BOUNDARY_FILES).includeNested(false);
@@ -164,5 +172,86 @@ public final class BazelProjectImporter extends AbstractProjectImporter {
     @Override
     public void reset() {
         directories = null;
+    }
+
+    /**
+     * Checks if Bazel Java integration is enabled by reading the configuration file.
+     * <p>
+     * This method reads the {@code .vscode/.bazel-java-enabled} file from the workspace root to determine whether
+     * Bazel Java support should be activated. The file is written by the VS Code extension based on the
+     * {@code java.bazel.enabled} configuration setting.
+     * </p>
+     * <p>
+     * To handle race conditions during startup, this method will wait briefly (up to 500ms) for the configuration
+     * file to appear if it doesn't exist initially. This ensures that the VS Code extension has time to write the
+     * configuration before JDTLS makes its activation decision.
+     * </p>
+     * <p>
+     * After successfully reading the configuration, the file is deleted to ensure it doesn't affect subsequent
+     * workspace openings. The VS Code extension will regenerate it on the next activation.
+     * </p>
+     *
+     * @return {@code true} if enabled (default), {@code false} if explicitly disabled
+     */
+    private boolean isBazelJavaEnabled() {
+        try {
+            // Get workspace root directory
+            if (rootFolder == null) {
+                return true; // Default to enabled if no root folder
+            }
+
+            Path workspaceRoot = rootFolder.toPath();
+            Path configFile = workspaceRoot.resolve(".vscode").resolve(".bazel-java-enabled");
+
+            // Wait for config file to appear (max 500ms)
+            // This handles race conditions where JDTLS starts before VS Code extension writes the config
+            boolean configFileFound = false;
+            for (int attempt = 0; attempt < 50; attempt++) {
+                if (Files.exists(configFile)) {
+                    configFileFound = true;
+                    break;
+                }
+                try {
+                    Thread.sleep(10); // Wait 10ms between checks
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    JavaLanguageServerPlugin.logInfo("Interrupted while waiting for Bazel config file");
+                    return true; // Default to enabled on interruption
+                }
+            }
+
+            // If config file doesn't exist after waiting, default to enabled
+            if (!configFileFound) {
+                JavaLanguageServerPlugin.logInfo(
+                    "No .bazel-java-enabled config file found after waiting. Defaulting to enabled.");
+                return true;
+            }
+
+            // Read file content
+            String content = Files.readString(configFile, StandardCharsets.UTF_8).trim();
+            boolean enabled = !"false".equalsIgnoreCase(content);
+
+            JavaLanguageServerPlugin.logInfo(
+                format("Bazel Java integration %s based on config file", enabled ? "enabled" : "disabled"));
+
+            // Delete the config file after reading to ensure clean state for next startup
+            // The VS Code extension will recreate it on next activation
+            try {
+                Files.deleteIfExists(configFile);
+                JavaLanguageServerPlugin.logInfo("Deleted temporary config file .bazel-java-enabled");
+            } catch (IOException e) {
+                // Log but don't fail if deletion fails - file will be overwritten next time
+                JavaLanguageServerPlugin.logInfo(
+                    format("Could not delete config file (will be overwritten on next start): %s", e.getMessage()));
+            }
+
+            return enabled;
+
+        } catch (Exception e) {
+            // On any error, default to enabled to avoid breaking Java projects
+            JavaLanguageServerPlugin.logError(
+                format("Failed to read Bazel enabled configuration: %s. Defaulting to enabled.", e.getMessage()));
+            return true;
+        }
     }
 }
