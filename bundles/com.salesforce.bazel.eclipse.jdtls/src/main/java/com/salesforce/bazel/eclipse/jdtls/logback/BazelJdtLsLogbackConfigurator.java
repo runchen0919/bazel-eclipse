@@ -57,6 +57,9 @@ public class BazelJdtLsLogbackConfigurator {
 
     private static void applyDebugLogLevels(LoggerContext lc) {
         ServiceTracker<DebugOptions, Object> tracker = openServiceTracker(DebugOptions.class);
+        if (tracker == null) {
+            return;
+        }
         try {
             var debugOptions = (DebugOptions) tracker.getService();
             if (debugOptions != null) {
@@ -112,7 +115,14 @@ public class BazelJdtLsLogbackConfigurator {
 
     private static <T> ServiceTracker<T, Object> openServiceTracker(Class<T> serviceClass) {
         var bundle = Platform.getBundle("com.salesforce.bazel.eclipse.core"); // fragments don't have a BundleContext
-        var tracker = new ServiceTracker<>(bundle.getBundleContext(), serviceClass, null);
+        if (bundle == null) {
+            return null;
+        }
+        var bundleContext = bundle.getBundleContext();
+        if (bundleContext == null) {
+            return null;
+        }
+        var tracker = new ServiceTracker<>(bundleContext, serviceClass, null);
         tracker.open();
         return tracker;
     }

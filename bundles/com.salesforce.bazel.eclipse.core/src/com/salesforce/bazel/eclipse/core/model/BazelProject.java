@@ -26,6 +26,8 @@ import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -120,7 +122,15 @@ public class BazelProject implements IProjectNature {
     private static String getOrFixWorkspaceRootPropertyValue(IProject project) throws CoreException {
         var workspaceRootPropertyValue = project.getPersistentProperty(PROJECT_PROPERTY_WORKSPACE_ROOT);
         if (workspaceRootPropertyValue != null) {
-            return workspaceRootPropertyValue;
+            if (isBazelExecrootPath(workspaceRootPropertyValue)) {
+                LOG.debug(
+                    "Clearing stale Bazel execroot workspace root '{}' for project '{}'.",
+                    workspaceRootPropertyValue,
+                    project.getName());
+                project.setPersistentProperty(PROJECT_PROPERTY_WORKSPACE_ROOT, null);
+            } else {
+                return workspaceRootPropertyValue;
+            }
         }
 
         var location =
@@ -128,8 +138,28 @@ public class BazelProject implements IProjectNature {
         while (true) {
             var workspaceFile = BazelWorkspace.findWorkspaceFile(location.toPath());
             if (workspaceFile != null) {
-                project.setPersistentProperty(PROJECT_PROPERTY_WORKSPACE_ROOT, location.toString());
-                return location.toString();
+                var locationStr = location.toString();
+                if (isBazelExecrootPath(locationStr)) {
+                    // execroot contains WORKSPACE symlinks pointing to the real workspace;
+                    // resolve the symlink to recover the actual workspace root
+                    var resolved = resolveRealWorkspaceRoot(workspaceFile);
+                    if (resolved != null) {
+                        LOG.debug(
+                            "Resolved execroot WORKSPACE symlink '{}' to real workspace root '{}' for project '{}'.",
+                            locationStr,
+                            resolved,
+                            project.getName());
+                        project.setPersistentProperty(PROJECT_PROPERTY_WORKSPACE_ROOT, resolved);
+                        return resolved;
+                    }
+                    LOG.debug(
+                        "Skipping Bazel execroot path '{}' as workspace root for project '{}'.",
+                        locationStr,
+                        project.getName());
+                } else {
+                    project.setPersistentProperty(PROJECT_PROPERTY_WORKSPACE_ROOT, locationStr);
+                    return locationStr;
+                }
             }
 
             if (location.isRoot()) {
@@ -140,6 +170,26 @@ public class BazelProject implements IProjectNature {
             // continue with parent
             location = location.removeLastSegments(1);
         }
+    }
+
+    private static String resolveRealWorkspaceRoot(Path workspaceFile) {
+        try {
+            if (!Files.isSymbolicLink(workspaceFile)) {
+                return null;
+            }
+            var realPath = workspaceFile.toRealPath();
+            var realParent = realPath.getParent();
+            if (realParent != null && !isBazelExecrootPath(realParent.toString())) {
+                return realParent.toString();
+            }
+        } catch (IOException e) {
+            LOG.debug("Failed to resolve WORKSPACE symlink '{}': {}", workspaceFile, e.getMessage());
+        }
+        return null;
+    }
+
+    private static boolean isBazelExecrootPath(String path) {
+        return path.contains("/_bazel_") && path.contains("/execroot/");
     }
 
     /**

@@ -59,11 +59,15 @@ public class BazelJavaSDKInit {
      *            Human friendly tool name, may appear in log messages for example.
      */
     public static void initialize(String toolName) {
+        requireNonNull(toolName);
         if (BazelJavaSDKInit.toolName != null) {
+            if (BazelJavaSDKInit.toolName.equals(toolName)) {
+                return;
+            }
             throw new IllegalStateException(
                     "The tool cannot be changed at runtime! Please call BazelJavaDSKInit only once.");
         }
-        BazelJavaSDKInit.toolName = requireNonNull(toolName);
+        BazelJavaSDKInit.toolName = toolName;
 
         // initialize Bazel IntelliJ Singletons
         Kind.ApplicationState
