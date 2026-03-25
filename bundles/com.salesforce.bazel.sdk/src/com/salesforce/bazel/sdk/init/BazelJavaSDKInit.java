@@ -58,7 +58,7 @@ public class BazelJavaSDKInit {
      * @param toolName
      *            Human friendly tool name, may appear in log messages for example.
      */
-    public static void initialize(String toolName) {
+    public static synchronized void initialize(String toolName) {
         requireNonNull(toolName);
         if (BazelJavaSDKInit.toolName != null) {
             if (BazelJavaSDKInit.toolName.equals(toolName)) {

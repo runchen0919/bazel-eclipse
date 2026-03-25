@@ -172,6 +172,13 @@ public class BazelProject implements IProjectNature {
         }
     }
 
+    /**
+     * Resolves the real workspace root from an execroot WORKSPACE symlink.
+     *
+     * @param workspaceFile
+     *            the WORKSPACE or WORKSPACE.bazel file found in an execroot location
+     * @return the real workspace root path, or {@code null} if resolution fails
+     */
     private static String resolveRealWorkspaceRoot(Path workspaceFile) {
         try {
             if (!Files.isSymbolicLink(workspaceFile)) {
@@ -188,6 +195,12 @@ public class BazelProject implements IProjectNature {
         return null;
     }
 
+    /**
+     * Checks whether the given path is inside a Bazel execroot directory.
+     * <p>
+     * Uses Unix path separators only; Bazel on Windows is not supported.
+     * </p>
+     */
     private static boolean isBazelExecrootPath(String path) {
         return path.contains("/_bazel_") && path.contains("/execroot/");
     }

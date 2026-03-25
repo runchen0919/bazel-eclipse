@@ -85,6 +85,14 @@ public final class BazelProjectImporter extends AbstractProjectImporter {
         return !this.directories.isEmpty();
     }
 
+    /**
+     * {@inheritDoc}
+     * <p>
+     * <b>Side effect:</b> This method cleans up stale Eclipse project files ({@code .project}, {@code .classpath},
+     * {@code .settings}) from a previous session before performing detection. This is necessary because stale
+     * metadata can interfere with workspace detection and cause import failures.
+     * </p>
+     */
     @Override
     public boolean applies(IProgressMonitor monitor) throws OperationCanceledException, CoreException {
         cleanupStaleProjectFilesIfNeeded();
@@ -190,6 +198,8 @@ public final class BazelProjectImporter extends AbstractProjectImporter {
                     return container == null;
                 });
             } catch (IOException e) {
+                JavaLanguageServerPlugin.logInfo(
+                    "Failed to check stale project files in " + eclipseProjectsDir + ": " + e.getMessage());
             }
         }
 
@@ -214,6 +224,8 @@ public final class BazelProjectImporter extends AbstractProjectImporter {
                         return FileVisitResult.CONTINUE;
                     }
                     var dirName = name.toString();
+                    // Skip Bazel convenience symlinks (bazel-bin, bazel-out, etc.);
+                    // non-symlink dirs starting with "bazel-" are still traversed.
                     if (dirName.startsWith("bazel-") && Files.isSymbolicLink(dir)) {
                         return FileVisitResult.SKIP_SUBTREE;
                     }
@@ -224,6 +236,7 @@ public final class BazelProjectImporter extends AbstractProjectImporter {
                         return FileVisitResult.SKIP_SUBTREE;
                     }
                     if (".settings".equals(dirName)) {
+                        JavaLanguageServerPlugin.logInfo("Deleting stale .settings directory: " + dir);
                         deleteRecursively(dir);
                         return FileVisitResult.SKIP_SUBTREE;
                     }
@@ -236,7 +249,10 @@ public final class BazelProjectImporter extends AbstractProjectImporter {
                     if (".project".equals(fileName) || ".classpath".equals(fileName)) {
                         try {
                             Files.deleteIfExists(file);
-                        } catch (IOException ignored) {
+                            JavaLanguageServerPlugin.logInfo("Deleted stale project file: " + file);
+                        } catch (IOException e) {
+                            JavaLanguageServerPlugin.logInfo(
+                                "Failed to delete stale file " + file + ": " + e.getMessage());
                         }
                     }
                     return FileVisitResult.CONTINUE;
@@ -277,7 +293,9 @@ public final class BazelProjectImporter extends AbstractProjectImporter {
                     return FileVisitResult.CONTINUE;
                 }
             });
-        } catch (IOException ignored) {
+        } catch (IOException e) {
+            JavaLanguageServerPlugin.logInfo(
+                "Failed to delete directory recursively " + dir + ": " + e.getMessage());
         }
     }
 
