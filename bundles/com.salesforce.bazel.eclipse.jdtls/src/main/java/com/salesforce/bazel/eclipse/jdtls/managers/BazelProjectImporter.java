@@ -59,6 +59,12 @@ import com.salesforce.bazel.eclipse.core.setup.ImportBazelWorkspaceJob;
 @SuppressWarnings("restriction")
 public final class BazelProjectImporter extends AbstractProjectImporter {
 
+    private static final String BAZEL_SYMLINK_PREFIX = "bazel-";
+    private static final String DIR_SETTINGS = ".settings";
+    private static final String DIR_ECLIPSE = ".eclipse";
+    private static final String DIR_NODE_MODULES = "node_modules";
+
+
     @Override
     public boolean applies(Collection<IPath> projectConfigurations, IProgressMonitor monitor)
             throws OperationCanceledException, CoreException {
@@ -226,16 +232,16 @@ public final class BazelProjectImporter extends AbstractProjectImporter {
                     var dirName = name.toString();
                     // Skip Bazel convenience symlinks (bazel-bin, bazel-out, etc.);
                     // non-symlink dirs starting with "bazel-" are still traversed.
-                    if (dirName.startsWith("bazel-") && Files.isSymbolicLink(dir)) {
+                    if (dirName.startsWith(BAZEL_SYMLINK_PREFIX) && Files.isSymbolicLink(dir)) {
                         return FileVisitResult.SKIP_SUBTREE;
                     }
-                    if (dirName.startsWith(".") && !".settings".equals(dirName) && !".eclipse".equals(dirName)) {
+                    if (dirName.startsWith(".") && !DIR_SETTINGS.equals(dirName) && !DIR_ECLIPSE.equals(dirName)) {
                         return FileVisitResult.SKIP_SUBTREE;
                     }
-                    if ("node_modules".equals(dirName)) {
+                    if (DIR_NODE_MODULES.equals(dirName)) {
                         return FileVisitResult.SKIP_SUBTREE;
                     }
-                    if (".settings".equals(dirName)) {
+                    if (DIR_SETTINGS.equals(dirName)) {
                         JavaLanguageServerPlugin.logInfo("Deleting stale .settings directory: " + dir);
                         deleteRecursively(dir);
                         return FileVisitResult.SKIP_SUBTREE;
