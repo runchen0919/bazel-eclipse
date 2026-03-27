@@ -21,8 +21,11 @@ import static java.nio.file.Files.isRegularFile;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Set;
@@ -56,6 +59,12 @@ import com.salesforce.bazel.eclipse.core.setup.ImportBazelWorkspaceJob;
 @SuppressWarnings("restriction")
 public final class BazelProjectImporter extends AbstractProjectImporter {
 
+    private static final String BAZEL_SYMLINK_PREFIX = "bazel-";
+    private static final String DIR_SETTINGS = ".settings";
+    private static final String DIR_ECLIPSE = ".eclipse";
+    private static final String DIR_NODE_MODULES = "node_modules";
+
+
     @Override
     public boolean applies(Collection<IPath> projectConfigurations, IProgressMonitor monitor)
             throws OperationCanceledException, CoreException {
@@ -82,8 +91,18 @@ public final class BazelProjectImporter extends AbstractProjectImporter {
         return !this.directories.isEmpty();
     }
 
+    /**
+     * {@inheritDoc}
+     * <p>
+     * <b>Side effect:</b> This method cleans up stale Eclipse project files ({@code .project}, {@code .classpath},
+     * {@code .settings}) from a previous session before performing detection. This is necessary because stale
+     * metadata can interfere with workspace detection and cause import failures.
+     * </p>
+     */
     @Override
     public boolean applies(IProgressMonitor monitor) throws OperationCanceledException, CoreException {
+        cleanupStaleProjectFilesIfNeeded();
+
         // Check if Bazel Java integration is enabled via configuration file
         if (!isBazelJavaEnabled()) {
             JavaLanguageServerPlugin.logInfo("Bazel Java integration is disabled via configuration");
@@ -166,6 +185,123 @@ public final class BazelProjectImporter extends AbstractProjectImporter {
             // note: we don't schedule the job but execute it directly
             var importBazelWorkspaceJob = new ImportBazelWorkspaceJob(workspace, projectViewLocation);
             importBazelWorkspaceJob.runInWorkspace(monitor.split(100));
+        }
+    }
+
+    private void cleanupStaleProjectFilesIfNeeded() {
+        var workspaceRoot = rootFolder.toPath();
+        if (!Files.exists(workspaceRoot.resolve(".project"))) {
+            return;
+        }
+        var eclipseRoot = ResourcesPlugin.getWorkspace().getRoot();
+        var isStale = false;
+
+        var eclipseProjectsDir = workspaceRoot.resolve(".eclipse").resolve("projects");
+        if (Files.isDirectory(eclipseProjectsDir)) {
+            try (var children = Files.list(eclipseProjectsDir)) {
+                isStale = children.filter(Files::isDirectory).anyMatch(projectDir -> {
+                    var container = eclipseRoot.getContainerForLocation(IPath.fromPath(projectDir));
+                    return container == null;
+                });
+            } catch (IOException e) {
+                JavaLanguageServerPlugin.logInfo(
+                    "Failed to check stale project files in " + eclipseProjectsDir + ": " + e.getMessage());
+            }
+        }
+
+        if (!isStale) {
+            var rootContainer = eclipseRoot.getContainerForLocation(IPath.fromPath(workspaceRoot));
+            isStale = rootContainer == null;
+        }
+
+        if (isStale) {
+            cleanupStaleProjectFiles(workspaceRoot);
+        }
+    }
+
+    private void cleanupStaleProjectFiles(Path workspaceRoot) {
+        JavaLanguageServerPlugin.logInfo("Cleaning up stale project files from previous session in " + workspaceRoot);
+        try {
+            Files.walkFileTree(workspaceRoot, new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                    var name = dir.getFileName();
+                    if (name == null) {
+                        return FileVisitResult.CONTINUE;
+                    }
+                    var dirName = name.toString();
+                    // Skip Bazel convenience symlinks (bazel-bin, bazel-out, etc.);
+                    // non-symlink dirs starting with "bazel-" are still traversed.
+                    if (dirName.startsWith(BAZEL_SYMLINK_PREFIX) && Files.isSymbolicLink(dir)) {
+                        return FileVisitResult.SKIP_SUBTREE;
+                    }
+                    if (dirName.startsWith(".") && !DIR_SETTINGS.equals(dirName) && !DIR_ECLIPSE.equals(dirName)) {
+                        return FileVisitResult.SKIP_SUBTREE;
+                    }
+                    if (DIR_NODE_MODULES.equals(dirName)) {
+                        return FileVisitResult.SKIP_SUBTREE;
+                    }
+                    if (DIR_SETTINGS.equals(dirName)) {
+                        JavaLanguageServerPlugin.logInfo("Deleting stale .settings directory: " + dir);
+                        deleteRecursively(dir);
+                        return FileVisitResult.SKIP_SUBTREE;
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                    var fileName = file.getFileName().toString();
+                    if (".project".equals(fileName) || ".classpath".equals(fileName)) {
+                        try {
+                            Files.deleteIfExists(file);
+                            JavaLanguageServerPlugin.logInfo("Deleted stale project file: " + file);
+                        } catch (IOException e) {
+                            JavaLanguageServerPlugin.logInfo(
+                                "Failed to delete stale file " + file + ": " + e.getMessage());
+                        }
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+
+            var eclipseProjectsDir = workspaceRoot.resolve(".eclipse").resolve("projects");
+            if (Files.isDirectory(eclipseProjectsDir)) {
+                deleteRecursively(eclipseProjectsDir);
+            }
+        } catch (IOException e) {
+            JavaLanguageServerPlugin.logInfo("Failed to clean up stale project files: " + e.getMessage());
+        }
+    }
+
+    private static void deleteRecursively(Path dir) {
+        try {
+            Files.walkFileTree(dir, new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    Files.deleteIfExists(file);
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult postVisitDirectory(Path d, IOException exc) throws IOException {
+                    Files.deleteIfExists(d);
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        } catch (IOException e) {
+            JavaLanguageServerPlugin.logInfo(
+                "Failed to delete directory recursively " + dir + ": " + e.getMessage());
         }
     }
 
