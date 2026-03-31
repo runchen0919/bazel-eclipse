@@ -384,7 +384,7 @@ public class JavaAspectsClasspathInfo extends JavaClasspathJarLocationResolver {
                     entry.setExported(true);
                     classpathBuilder.addCompileEntry(entry);
                 }
-            } else if (LOG.isDebugEnabled()) {
+            } else {
                 LOG.warn("Unable to resolve compile jar: {}", jdepsDependency);
             }
         }
