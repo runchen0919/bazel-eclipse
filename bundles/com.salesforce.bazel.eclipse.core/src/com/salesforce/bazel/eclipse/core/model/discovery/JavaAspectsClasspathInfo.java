@@ -612,6 +612,34 @@ public class JavaAspectsClasspathInfo extends JavaClasspathJarLocationResolver {
             jarEntry.setExported(exported);
             result.add(jarEntry);
         }
+
+        // When a dependency is resolved as jars (not a project), Eclipse's project-level
+        // export mechanism cannot propagate the dependency's own compile-time deps.
+        // Load the dependency's EXPLICIT jdeps entries and add them so that ECJ can resolve
+        // types in the dependency's public API (e.g., parent classes like SpecificRecord
+        // for Avro-generated classes).
+        var depInfo = aspectsInfo.get(targetKey);
+        if (depInfo != null) {
+            var depJdeps = loadJdeps(depInfo);
+            for (JdepsDependency jdep : depJdeps) {
+                if (jdep.dependencyKind() == Kind.EXPLICIT) {
+                    var library = aspectsInfo.getLibraryByJdepsRootRelativePath(
+                        jdep.artifactLocation().getRelativePath());
+                    if (library != null) {
+                        var jarEntry = resolveJar(library.libraryArtifact);
+                        if ((jarEntry != null) && validateEntry(jarEntry)) {
+                            jarEntry.getAccessRules()
+                                    .add(
+                                        new AccessRule(
+                                                PATTERN_EVERYTHING,
+                                                IAccessRule.K_DISCOURAGED | IAccessRule.IGNORE_IF_BETTER));
+                            result.add(jarEntry);
+                        }
+                    }
+                }
+            }
+        }
+
         return result;
     }
 
