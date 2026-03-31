@@ -1262,7 +1262,28 @@ public abstract class BaseProvisioningStrategy implements TargetProvisioningStra
             }
         }
 
-        return null;
+        // none of the detected packages is a prefix of all others (sibling packages case)
+        // compute the actual longest common prefix path
+        // e.g. for [com/foo/bar/dto, com/foo/bar/merge] this yields com/foo/bar
+        IPath commonPrefix = null;
+        for (IPath path : detectedJavaPackagesForSourceDirectory) {
+            if (commonPrefix == null) {
+                commonPrefix = path;
+            } else {
+                var minLen = Math.min(commonPrefix.segmentCount(), path.segmentCount());
+                var commonLen = 0;
+                for (var i = 0; i < minLen; i++) {
+                    if (commonPrefix.segment(i).equals(path.segment(i))) {
+                        commonLen = i + 1;
+                    } else {
+                        break;
+                    }
+                }
+                commonPrefix = commonPrefix.uptoSegment(commonLen);
+            }
+        }
+
+        return (commonPrefix == null) || commonPrefix.isEmpty() ? null : commonPrefix;
     }
 
     private IProject findProjectForLocation(IPath location) {
