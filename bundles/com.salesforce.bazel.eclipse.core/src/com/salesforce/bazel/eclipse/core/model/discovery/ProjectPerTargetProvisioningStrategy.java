@@ -1,6 +1,7 @@
 package com.salesforce.bazel.eclipse.core.model.discovery;
 
 import static java.lang.String.format;
+import static java.util.stream.Collectors.groupingBy;
 import static java.util.stream.Collectors.toList;
 import static org.eclipse.core.runtime.SubMonitor.SUPPRESS_ALL_LABELS;
 
@@ -8,13 +9,15 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 import org.eclipse.core.runtime.CoreException;
+import org.eclipse.core.runtime.IPath;
 import org.eclipse.core.runtime.IProgressMonitor;
-import org.eclipse.core.runtime.Status;
+import org.eclipse.core.runtime.NullProgressMonitor;
 import org.eclipse.core.runtime.SubMonitor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,10 +32,12 @@ import com.salesforce.bazel.eclipse.core.model.BazelProject;
 import com.salesforce.bazel.eclipse.core.model.BazelTarget;
 import com.salesforce.bazel.eclipse.core.model.BazelWorkspace;
 import com.salesforce.bazel.eclipse.core.model.BazelWorkspaceBlazeInfo;
+import com.salesforce.bazel.eclipse.core.model.discovery.projects.JavaProjectInfo;
 import com.salesforce.bazel.eclipse.core.util.trace.TracingSubMonitor;
 import com.salesforce.bazel.sdk.aspects.intellij.IntellijAspects;
 import com.salesforce.bazel.sdk.aspects.intellij.IntellijAspects.OutputGroup;
 import com.salesforce.bazel.sdk.command.BazelBuildWithIntelliJAspectsCommand;
+import com.salesforce.bazel.sdk.command.querylight.BazelRuleAttribute;
 import com.salesforce.bazel.sdk.model.BazelLabel;
 
 /**
@@ -62,21 +67,17 @@ public class ProjectPerTargetProvisioningStrategy extends BaseProvisioningStrate
      * packages that may not exist in the workspace.
      */
     private void addPackageForLabel(Label label, BazelWorkspace workspace, Set<BazelPackage> packages) {
-        // Skip external packages as they may not have corresponding workspace packages
         if (label.isExternal()) {
-            LOG.trace("Skipping external label: {}", label);
             return;
         }
-
-        var bazelPackage = workspace.getBazelPackage(new BazelLabel(label));
-
-        // Only add if the package exists and is accessible
-        if (!bazelPackage.exists()) {
-            LOG.trace("Skipping non-existing package label: {}", label);
-            return;
+        try {
+            var bazelPackage = workspace.getBazelPackage(new BazelLabel(label));
+            if (bazelPackage.exists()) {
+                packages.add(bazelPackage);
+            }
+        } catch (IllegalArgumentException e) {
+            LOG.trace("Skipping label not rooted at workspace: {}", label);
         }
-
-        packages.add(bazelPackage);
     }
 
     /**
@@ -93,36 +94,42 @@ public class ProjectPerTargetProvisioningStrategy extends BaseProvisioningStrate
      * @return set of BazelPackages to pre-load
      * @throws CoreException
      */
+    private void collectDependencyPackagesForTarget(BazelTarget target, JavaAspectsInfo aspectsInfo,
+            BazelWorkspace workspace, Set<BazelPackage> packages) {
+        var targetKey = TargetKey.forPlainTarget(target.getLabel().toPrimitive());
+        var targetInfo = aspectsInfo.get(targetKey);
+
+        if (targetInfo != null) {
+            for (var dep : targetInfo.getDependencies()) {
+                addPackageForLabel(dep.getTargetKey().getLabel(), workspace, packages);
+            }
+
+            var runtimeClasspath = aspectsInfo.getRuntimeClasspath(targetKey);
+            if (runtimeClasspath != null) {
+                for (var jar : runtimeClasspath) {
+                    if (jar.targetKey != null) {
+                        addPackageForLabel(jar.targetKey.getLabel(), workspace, packages);
+                    }
+                }
+            }
+        }
+    }
+
     private Set<BazelPackage> collectDependencyPackages(Collection<BazelProject> bazelProjects,
             JavaAspectsInfo aspectsInfo, BazelWorkspace workspace) throws CoreException {
         Set<BazelPackage> packages = new HashSet<>();
 
         for (BazelProject bazelProject : bazelProjects) {
-            // Skip projects that don't have a proper target yet
             if (!bazelProject.isTargetProject()) {
-                LOG.trace("Skipping project {} - not a target project or target is null", bazelProject.getName());
                 continue;
             }
 
-            // Collect all dependency labels from the aspects info
-            var targetKey = TargetKey.forPlainTarget(bazelProject.getBazelTarget().getLabel().toPrimitive());
-            var targetInfo = aspectsInfo.get(targetKey);
+            // Collect deps from the primary target
+            collectDependencyPackagesForTarget(bazelProject.getBazelTarget(), aspectsInfo, workspace, packages);
 
-            if (targetInfo != null) {
-                // Collect packages from direct dependencies
-                for (var dep : targetInfo.getDependencies()) {
-                    addPackageForLabel(dep.getTargetKey().getLabel(), workspace, packages);
-                }
-
-                // Collect packages from runtime dependencies
-                var runtimeClasspath = aspectsInfo.getRuntimeClasspath(targetKey);
-                if (runtimeClasspath != null) {
-                    for (var jar : runtimeClasspath) {
-                        if (jar.targetKey != null) {
-                            addPackageForLabel(jar.targetKey.getLabel(), workspace, packages);
-                        }
-                    }
-                }
+            // Also collect deps from unprovisioned sibling targets in the same package
+            for (BazelTarget sibling : getUnprovisionedSiblingTargets(bazelProject)) {
+                collectDependencyPackagesForTarget(sibling, aspectsInfo, workspace, packages);
             }
         }
 
@@ -136,19 +143,37 @@ public class ProjectPerTargetProvisioningStrategy extends BaseProvisioningStrate
         try {
             var monitor = SubMonitor.convert(progress, "Computing Bazel project classpaths", 1 + bazelProjects.size());
 
+            // Build targets list including unprovisioned sibling targets
             List<BazelLabel> targetsToBuild = new ArrayList<>(bazelProjects.size());
+            Set<BazelLabel> addedLabels = new HashSet<>();
+            Map<BazelProject, List<BazelTarget>> siblingTargetsMap = new HashMap<>();
+
             for (BazelProject bazelProject : bazelProjects) {
                 monitor.checkCanceled();
 
                 if (!bazelProject.isTargetProject()) {
-                    throw new CoreException(
-                            Status.error(
-                                format(
-                                    "Unable to compute classpath for project '%s'. Please check the setup. This is not a Bazel target project created by the project per target strategy.",
-                                    bazelProjects)));
+                    LOG.warn("Skipping non-target project '{}' in classpath computation", bazelProject.getName());
+                    continue;
                 }
 
-                targetsToBuild.add(bazelProject.getBazelTarget().getLabel());
+                // Add the primary target
+                var primaryLabel = bazelProject.getBazelTarget().getLabel();
+                if (addedLabels.add(primaryLabel)) {
+                    targetsToBuild.add(primaryLabel);
+                }
+
+                // Discover and add unprovisioned sibling targets from the same package
+                var siblings = getUnprovisionedSiblingTargets(bazelProject);
+                siblingTargetsMap.put(bazelProject, siblings);
+                for (BazelTarget sibling : siblings) {
+                    if (addedLabels.add(sibling.getLabel())) {
+                        targetsToBuild.add(sibling.getLabel());
+                    }
+                }
+            }
+
+            if (targetsToBuild.isEmpty()) {
+                return Map.of();
             }
 
             var workspaceRoot = workspace.getLocation().toPath();
@@ -188,18 +213,26 @@ public class ProjectPerTargetProvisioningStrategy extends BaseProvisioningStrate
             var aspectsInfo = new JavaAspectsInfo(result, workspace, aspects);
 
             // Performance optimization: Pre-load all dependency packages to avoid repeated Bazel queries
-            // This utilizes the existing batch optimization in BazelWorkspace.open()
-            var packagesToPreload = collectDependencyPackages(bazelProjects, aspectsInfo, workspace);
-            if (!packagesToPreload.isEmpty()) {
-                LOG.debug(
-                    "Pre-loading {} dependency packages to optimize classpath computation",
-                    packagesToPreload.size());
-                workspace.open(packagesToPreload);
+            try {
+                var packagesToPreload = collectDependencyPackages(bazelProjects, aspectsInfo, workspace);
+                if (!packagesToPreload.isEmpty()) {
+                    LOG.debug(
+                        "Pre-loading {} dependency packages to optimize classpath computation",
+                        packagesToPreload.size());
+                    workspace.open(packagesToPreload);
+                }
+            } catch (Exception e) {
+                LOG.warn("Failed to pre-load dependency packages, continuing without optimization", e);
             }
 
             for (BazelProject bazelProject : bazelProjects) {
                 monitor.subTask(bazelProject.getName());
                 monitor.checkCanceled();
+
+                if (!bazelProject.isTargetProject()) {
+                    monitor.worked(1);
+                    continue;
+                }
 
                 // build index of classpath info
                 var classpathInfo =
@@ -208,10 +241,19 @@ public class ProjectPerTargetProvisioningStrategy extends BaseProvisioningStrate
                 // remove old marker
                 deleteClasspathContainerProblems(bazelProject);
 
-                // add the target
+                // add the primary target
                 var problem = classpathInfo.addTarget(bazelProject.getBazelTarget());
                 if (!problem.isOK()) {
                     createClasspathContainerProblem(bazelProject, problem);
+                }
+
+                // add unprovisioned sibling targets so their deps are included in the classpath
+                var siblings = siblingTargetsMap.getOrDefault(bazelProject, List.of());
+                for (BazelTarget sibling : siblings) {
+                    var siblingProblem = classpathInfo.addTarget(sibling);
+                    if (!siblingProblem.isOK()) {
+                        createClasspathContainerProblem(bazelProject, siblingProblem);
+                    }
                 }
 
                 // compute the classpath
@@ -229,21 +271,137 @@ public class ProjectPerTargetProvisioningStrategy extends BaseProvisioningStrate
         }
     }
 
+    private JavaProjectInfo collectJavaInfoForAnalysis(BazelPackage bazelPackage, BazelTarget sampleTarget)
+            throws CoreException {
+        var javaInfo = new JavaProjectInfo(bazelPackage);
+        var attributes = sampleTarget.getRuleAttributes();
+        var srcs = attributes.getStringList(BazelRuleAttribute.SRCS);
+        if (srcs != null) {
+            for (String src : srcs) {
+                javaInfo.addSrc(src, null);
+            }
+        }
+        javaInfo.analyzeProjectRecommendations(false, new NullProgressMonitor());
+        return javaInfo;
+    }
+
     @Override
     protected List<BazelProject> doProvisionProjects(Collection<BazelTarget> targets, TracingSubMonitor monitor)
             throws CoreException {
         monitor.setWorkRemaining(targets.size());
         List<BazelProject> result = new ArrayList<>();
-        for (BazelTarget target : targets) {
-            monitor.subTask(target.getLabel().toString());
 
-            // provision project
-            var project = provisionProjectForTarget(target, monitor);
-            if (project != null) {
-                result.add(project);
+        var targetsByPackage = targets.stream()
+                .collect(groupingBy(BazelTarget::getBazelPackage, LinkedHashMap::new, toList()));
+
+        for (var entry : targetsByPackage.entrySet()) {
+            var bazelPackage = entry.getKey();
+            var packageTargets = entry.getValue();
+
+            if (packageTargets.size() > 1 && hasEmptySourceRoot(bazelPackage, packageTargets)) {
+                LOG.debug("Detected empty source root for package '{}', merging {} targets into one project",
+                    bazelPackage, packageTargets.size());
+                var project = provisionMergedTargetProject(bazelPackage, packageTargets, monitor);
+                if (project != null) {
+                    result.add(project);
+                }
+            } else {
+                for (BazelTarget target : packageTargets) {
+                    monitor.subTask(target.getLabel().toString());
+                    var project = provisionProjectForTarget(target, monitor);
+                    if (project != null) {
+                        result.add(project);
+                    }
+                }
             }
         }
         return result;
+    }
+
+    /**
+     * Returns unprovisioned sibling java_* targets in the same package. For merged projects, these are the targets that
+     * were skipped during provisioning but whose dependencies should be included in classpath computation.
+     */
+    private List<BazelTarget> getUnprovisionedSiblingTargets(BazelProject bazelProject) throws CoreException {
+        var primaryTarget = bazelProject.getBazelTarget();
+        var bazelPackage = primaryTarget.getBazelPackage();
+        List<BazelTarget> siblings = new ArrayList<>();
+        for (BazelTarget t : bazelPackage.getBazelTargets()) {
+            if (t.getTargetName().equals(primaryTarget.getTargetName())) {
+                continue;
+            }
+            if (t.hasBazelProject()) {
+                continue;
+            }
+            if (isJavaRule(t.getRuleClass())) {
+                siblings.add(t);
+            }
+        }
+        return siblings;
+    }
+
+    /**
+     * Merges multiple targets sharing an empty source root into a single target project. The primary target (the
+     * java_library with the most sources) is used for the project identity, but all targets' source files are included.
+     */
+    private BazelProject provisionMergedTargetProject(BazelPackage bazelPackage, List<BazelTarget> allTargets,
+            TracingSubMonitor monitor) throws CoreException {
+        var primaryTarget = selectPrimaryTarget(allTargets);
+        monitor.subTask(primaryTarget.getLabel().toString());
+        monitor = monitor.split(1, "Provisioning merged project for " + primaryTarget.getLabel());
+
+        var project = provisionTargetProject(primaryTarget, monitor.slice(1));
+
+        // Build Java info from ALL targets in the package
+        var javaInfo = collectJavaInfo(project, allTargets, monitor.slice(1));
+
+        // Configure links and classpath using combined info
+        linkSourcesIntoProject(project, javaInfo, monitor.slice(1));
+        linkGeneratedSourcesIntoProject(project, javaInfo, monitor.slice(1));
+        linkJarsIntoProject(project, javaInfo, monitor.slice(1));
+        configureRawClasspath(project, javaInfo, monitor.slice(1));
+
+        return project;
+    }
+
+    /**
+     * Selects the primary target from a list of targets. Prefers the java_library with the most source files.
+     */
+    private BazelTarget selectPrimaryTarget(List<BazelTarget> targets) throws CoreException {
+        BazelTarget primary = null;
+        int maxSrcs = -1;
+        for (BazelTarget target : targets) {
+            if (!"java_library".equals(target.getRuleClass())) {
+                continue;
+            }
+            var srcs = target.getRuleAttributes().getStringList(BazelRuleAttribute.SRCS);
+            int count = (srcs != null) ? srcs.size() : 0;
+            if (count > maxSrcs) {
+                maxSrcs = count;
+                primary = target;
+            }
+        }
+        return primary != null ? primary : targets.get(0);
+    }
+
+    private boolean hasEmptySourceRoot(BazelPackage bazelPackage, List<BazelTarget> targets) {
+        for (BazelTarget target : targets) {
+            try {
+                var javaInfo = collectJavaInfoForAnalysis(bazelPackage, target);
+                if (javaInfo.getSourceInfo().hasSourceDirectories()
+                        && javaInfo.getSourceInfo().getSourceDirectories().stream().anyMatch(IPath::isEmpty)) {
+                    return true;
+                }
+            } catch (CoreException e) {
+                LOG.debug("Failed to analyze target '{}': {}", target, e.getMessage());
+            }
+        }
+        return false;
+    }
+
+    private boolean isJavaRule(String ruleClass) {
+        return "java_library".equals(ruleClass) || "java_import".equals(ruleClass)
+                || "java_binary".equals(ruleClass) || "java_test".equals(ruleClass);
     }
 
     protected BazelProject provisionJavaBinaryProject(BazelTarget target, TracingSubMonitor monitor)

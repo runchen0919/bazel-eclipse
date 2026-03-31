@@ -358,6 +358,8 @@ public class JavaAspectsClasspathInfo extends JavaClasspathJarLocationResolver {
                 var libraryArtifact = new LibraryArtifact(artifact, classJar, srcJars);
                 var targetKey = targetLabel != null ? TargetKey.forPlainTarget(targetLabel) : null;
                 library = new BlazeJarLibrary(libraryArtifact, targetKey);
+                // Register back to avoid repeated fallback for the same jar across multiple targets
+                aspectsInfo.registerFallbackLibrary(artifact.getRelativePath(), library);
             }
             var entry = resolveLibrary(library);
             if (entry != null) {
@@ -375,9 +377,14 @@ public class JavaAspectsClasspathInfo extends JavaClasspathJarLocationResolver {
                     classpathBuilder.addCompileEntry(entry);
                 } else {
                     entry.getAccessRules().add(new AccessRule(PATTERN_EVERYTHING, IAccessRule.K_ACCESSIBLE));
+                    // Export EXPLICIT jdeps entries so downstream projects can resolve types
+                    // referenced in this project's public API. This addresses ECJ vs javac differences:
+                    // ECJ aggressively resolves all types in the API chain, while javac may not
+                    // record them in jdeps of downstream targets.
+                    entry.setExported(true);
                     classpathBuilder.addCompileEntry(entry);
                 }
-            } else if (LOG.isDebugEnabled()) {
+            } else {
                 LOG.warn("Unable to resolve compile jar: {}", jdepsDependency);
             }
         }

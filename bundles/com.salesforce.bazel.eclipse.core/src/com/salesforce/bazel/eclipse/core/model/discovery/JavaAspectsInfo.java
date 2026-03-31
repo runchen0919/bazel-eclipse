@@ -261,6 +261,18 @@ public class JavaAspectsInfo extends JavaClasspathJarLocationResolver {
         var classJar = libraryArtifact.getClassJar();
         if (classJar != null) {
             libraryByJdepsRootRelativePath.put(classJar.getRelativePath(), library);
+
+            // When there is no interfaceJar (e.g., libraries discovered from runtime classpath),
+            // also index under potential ijar/hjar paths so that jdeps lookups can find them.
+            // jdeps files typically reference ijar/hjar paths, not class jar paths.
+            if (interfaceJar == null) {
+                var classPath = classJar.getRelativePath();
+                if (classPath.endsWith(".jar")) {
+                    var base = classPath.substring(0, classPath.length() - ".jar".length());
+                    libraryByJdepsRootRelativePath.putIfAbsent(base + "-ijar.jar", library);
+                    libraryByJdepsRootRelativePath.putIfAbsent(base + "-hjar.jar", library);
+                }
+            }
         }
     }
 
@@ -274,6 +286,14 @@ public class JavaAspectsInfo extends JavaClasspathJarLocationResolver {
 
     public BlazeJarLibrary getLibraryByJdepsRootRelativePath(String relativePath) {
         return libraryByJdepsRootRelativePath.get(relativePath);
+    }
+
+    /**
+     * Registers a fallback library discovered during jdeps resolution so that subsequent lookups for the same path
+     * don't need to repeat the fallback logic.
+     */
+    public void registerFallbackLibrary(String relativePath, BlazeJarLibrary library) {
+        libraryByJdepsRootRelativePath.putIfAbsent(relativePath, library);
     }
 
     /**
