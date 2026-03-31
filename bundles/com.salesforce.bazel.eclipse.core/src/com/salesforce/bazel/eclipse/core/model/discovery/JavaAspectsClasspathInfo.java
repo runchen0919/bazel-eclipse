@@ -358,6 +358,8 @@ public class JavaAspectsClasspathInfo extends JavaClasspathJarLocationResolver {
                 var libraryArtifact = new LibraryArtifact(artifact, classJar, srcJars);
                 var targetKey = targetLabel != null ? TargetKey.forPlainTarget(targetLabel) : null;
                 library = new BlazeJarLibrary(libraryArtifact, targetKey);
+                // Register back to avoid repeated fallback for the same jar across multiple targets
+                aspectsInfo.registerFallbackLibrary(artifact.getRelativePath(), library);
             }
             var entry = resolveLibrary(library);
             if (entry != null) {
