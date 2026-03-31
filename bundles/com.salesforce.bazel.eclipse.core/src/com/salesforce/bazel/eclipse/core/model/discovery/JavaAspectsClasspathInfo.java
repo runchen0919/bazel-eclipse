@@ -375,6 +375,11 @@ public class JavaAspectsClasspathInfo extends JavaClasspathJarLocationResolver {
                     classpathBuilder.addCompileEntry(entry);
                 } else {
                     entry.getAccessRules().add(new AccessRule(PATTERN_EVERYTHING, IAccessRule.K_ACCESSIBLE));
+                    // Export EXPLICIT jdeps entries so downstream projects can resolve types
+                    // referenced in this project's public API. This addresses ECJ vs javac differences:
+                    // ECJ aggressively resolves all types in the API chain, while javac may not
+                    // record them in jdeps of downstream targets.
+                    entry.setExported(true);
                     classpathBuilder.addCompileEntry(entry);
                 }
             } else if (LOG.isDebugEnabled()) {
